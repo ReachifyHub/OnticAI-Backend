@@ -80,11 +80,11 @@ INITIAL_CODES = {
         DATA_DIR: data_vol,
         HF_CACHE: hf_cache_vol,
     },
-    timeout=1800,
-    allow_concurrent_inputs=4,   # 4 users share a single L4
+    timeout=1800,   # 4 users share a single L4
     max_containers=5,         # cap total L4s at 5 (budget shield)
     scaledown_window=180,        # keep warm 3 min after last request
 )
+@modal.concurrent(max_inputs=4) 
 class QwenTTS:
     # Loaded once per container, reused across all requests
     @modal.enter()

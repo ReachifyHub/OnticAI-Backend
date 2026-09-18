@@ -4,9 +4,6 @@
 # ============================================================
 
 import modal
-import os, io, re, json, uuid
-import numpy as np
-import soundfile as sf
 
 # ---------- Modal App & Volume ----------
 app = modal.App("ontic-ai")
@@ -33,8 +30,6 @@ image = (
 )
 
 # ---------- Tester Codes ----------
-# Each tester gets 2 TTS generations + 1 voice clone.
-# Send one code to each of your 10 testers.
 INITIAL_CODES = {
     "ONTIC-7K3P": {"tts_left": 2, "clone_left": 1},
     "ONTIC-M9XQ": {"tts_left": 2, "clone_left": 1},
@@ -49,26 +44,6 @@ INITIAL_CODES = {
 }
 
 
-# ---------- Code storage helpers ----------
-def _load_codes():
-    if os.path.exists(CODES_FILE):
-        try:
-            with open(CODES_FILE, "r") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and data:
-                return data
-        except (json.JSONDecodeError, OSError):
-            pass
-    # First boot: seed from INITIAL_CODES
-    return {k: dict(v) for k, v in INITIAL_CODES.items()}
-
-
-def _save_codes(codes: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CODES_FILE, "w") as f:
-        json.dump(codes, f, indent=2)
-
-
 # ---------- Modal function ----------
 @app.function(
     image=image,
@@ -80,11 +55,32 @@ def _save_codes(codes: dict):
 @modal.concurrent(max_inputs=20)
 @modal.asgi_app()
 def api():
+    # === All heavy imports live inside the container ===
+    import os, io, re, json, uuid
+    import numpy as np
+    import soundfile as sf
+    import torch
     from fastapi import FastAPI, UploadFile, File, Form, HTTPException
     from fastapi.responses import FileResponse
     from fastapi.middleware.cors import CORSMiddleware
-    import torch
     from qwen_tts import Qwen3TTSModel
+
+    # ---------- Code storage helpers (inside so they see the mounted volume) ----------
+    def _load_codes():
+        if os.path.exists(CODES_FILE):
+            try:
+                with open(CODES_FILE, "r") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data:
+                    return data
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {k: dict(v) for k, v in INITIAL_CODES.items()}
+
+    def _save_codes(codes: dict):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(CODES_FILE, "w") as f:
+            json.dump(codes, f, indent=2)
 
     # Ensure dirs exist
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -95,7 +91,7 @@ def api():
         _save_codes(_load_codes())
         vol.commit()
 
-    # Load the model once
+    # Load the model once per container
     print("Loading Qwen3-TTS 1.7B Base …")
     model = Qwen3TTSModel.from_pretrained(
         "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
@@ -108,7 +104,7 @@ def api():
     fapp = FastAPI()
     fapp.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],       # Netlify URL — safe for beta
+        allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -200,7 +196,6 @@ def api():
         if len(target_text) > 500:
             raise HTTPException(status_code=400, detail="Target text exceeds 500 characters")
 
-        # Read reference audio
         data = await ref_audio.read()
         try:
             arr, sr = sf.read(io.BytesIO(data))

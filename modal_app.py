@@ -82,7 +82,7 @@ INITIAL_CODES = {
     },
     timeout=1800,
     allow_concurrent_inputs=4,   # 4 users share a single L4
-    concurrency_limit=5,         # cap total L4s at 5 (budget shield)
+    max_containers=5,         # cap total L4s at 5 (budget shield)
     scaledown_window=180,        # keep warm 3 min after last request
 )
 class QwenTTS:

@@ -78,7 +78,6 @@ INITIAL_CODES = {
     memory=8192,
     volumes={
         DATA_DIR: data_vol,
-        HF_CACHE: hf_cache_vol,
     },
     timeout=1800,   # 4 users share a single L4
     max_containers=5,         # cap total L4s at 5 (budget shield)

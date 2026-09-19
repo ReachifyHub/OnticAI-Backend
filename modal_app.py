@@ -1,11 +1,15 @@
 # ============================================================
-# Ontic AI — Backend (Modal + FastAPI + Qwen3-TTS 1.7B Base)
+# Ontic AI — Backend (Modal + FastAPI + Qwen3-TTS 1.7B Base + CustomVoice)
 # Deploy: modal deploy modal_app.py
 #
 # GPU:          Nvidia L4 (24GB VRAM, native FlashAttention-2)
 # Concurrency:  4 users per L4, max 5 L4s in the workspace
 # Caching:      Model weights baked into the image at build time
 #               Tester codes + generated WAVs in a persistent Volume
+#
+# Models:
+#   - Base         → voice cloning (user-uploaded reference)
+#   - CustomVoice  → preset-speaker TTS (9 built-in voices)
 # ============================================================
 
 import modal
@@ -44,12 +48,13 @@ def _download_model():
     from huggingface_hub import snapshot_download
     cache_dir = os.path.expanduser("~/.cache/huggingface")
     os.makedirs(cache_dir, exist_ok=True)
-    print("Pre-downloading Qwen3-TTS 1.7B Base into image cache...")
-    snapshot_download(
-        repo_id="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-        cache_dir=cache_dir,
-    )
-    print("✅ Model cached at image build time.")
+    for repo in [
+        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    ]:
+        print(f"Pre-downloading {repo} ...")
+        snapshot_download(repo_id=repo, cache_dir=cache_dir)
+    print("✅ Both models cached at image build time.")
 
 image = base_image.run_function(_download_model)
 
@@ -79,11 +84,11 @@ INITIAL_CODES = {
     volumes={
         DATA_DIR: data_vol,
     },
-    timeout=1800,   # 4 users share a single L4
-    max_containers=5,         # cap total L4s at 5 (budget shield)
+    timeout=1800,
+    max_containers=5,            # cap total L4s at 5 (budget shield)
     scaledown_window=180,        # keep warm 3 min after last request
 )
-@modal.concurrent(max_inputs=4) 
+@modal.concurrent(max_inputs=4)
 class QwenTTS:
     # Loaded once per container, reused across all requests
     @modal.enter()
@@ -95,14 +100,23 @@ class QwenTTS:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         os.makedirs(HF_CACHE, exist_ok=True)
 
-        print("Loading Qwen3-TTS 1.7B Base from image cache …")
-        self.model = Qwen3TTSModel.from_pretrained(
+        print("Loading Qwen3-TTS 1.7B Base (for cloning) …")
+        self.base_model = Qwen3TTSModel.from_pretrained(
             "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
             device_map="cuda:0",
             dtype=torch.bfloat16,
             attn_implementation="sdpa",   # unlocks FlashAttention-2 on L4
         )
-        print("✅ Model ready.")
+
+        print("Loading Qwen3-TTS 1.7B CustomVoice (for preset-speaker TTS) …")
+        self.custom_model = Qwen3TTSModel.from_pretrained(
+            "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            device_map="cuda:0",
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+
+        print("✅ Both models ready.")
 
     # ------------- Storage helpers -------------
     def _load_codes(self):
@@ -165,7 +179,7 @@ class QwenTTS:
                 "clone_left": e["clone_left"],
             }
 
-        # -------- Text-to-speech --------
+        # -------- Text-to-speech (preset speakers, CustomVoice model) --------
         @fapp.post("/api/generate")
         async def generate(
             code: str = Form(...),
@@ -188,8 +202,10 @@ class QwenTTS:
                 raise HTTPException(400, "Text exceeds 500 characters")
 
             try:
-                wavs, sr = self.model.generate_custom_voice(
-                    text=text, language=language, speaker=voice,
+                wavs, sr = self.custom_model.generate_custom_voice(
+                    text=text,
+                    language=language,
+                    speaker=voice,
                 )
             except Exception as e:
                 raise HTTPException(500, f"Generation failed: {e}")
@@ -203,7 +219,7 @@ class QwenTTS:
 
             return {"audio_url": f"/api/audio/{fname}", "tts_left": entry["tts_left"]}
 
-        # -------- Voice cloning --------
+        # -------- Voice cloning (Base model) --------
         @fapp.post("/api/clone")
         async def clone(
             code: str = Form(...),
@@ -235,7 +251,7 @@ class QwenTTS:
             sf.write(ref_path, arr, sr)
 
             try:
-                wavs, sr = self.model.generate_voice_clone(
+                wavs, sr = self.base_model.generate_voice_clone(
                     text=target_text,
                     language="English",
                     ref_audio=ref_path,

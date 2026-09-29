@@ -1,284 +1,241 @@
-"""
-VoxCPM2 Backend for Modal — Streaming, Voice Design, and Voice Cloning.
-Deploy with: modal deploy modal_backend.py
-"""
-
-import modal
-import io
-import uuid
-import re
+"""VoxCPM2 backend for Modal — streaming TTS with voice design + cloning."""
+import asyncio, io, re, threading, uuid
 from pathlib import Path
 
-# --- Configuration ---
-APP_NAME = "voxcpm2-voiceover-backend"
+import modal
+
+APP_NAME = "voxcpm2-voiceover"
 MODEL_ID = "openbmb/VoxCPM2"
-MODEL_REVISION = "bffb3df5a29440629464e5e839f4d214c8714c3d" # Pin for stability
+MODEL_REVISION = "main"
 MODEL_CACHE_PATH = "/models"
-REFERENCE_CACHE_PATH = "/voice-references"
+REFERENCE_CACHE_PATH = "/voices"
 
-# --- Modal Infrastructure ---
 app = modal.App(APP_NAME)
-
-# Persistant volumes for caching model weights and voice references
 model_volume = modal.Volume.from_name("voxcpm2-models", create_if_missing=True)
 reference_volume = modal.Volume.from_name("voxcpm2-voices", create_if_missing=True)
 
-# Custom image with necessary dependencies
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "clang", "build-essential")
     .uv_pip_install(
-        "torch>=2.5.0",
-        "torchaudio",
+        "torch==2.5.1",
+        "torchaudio==2.5.1",
         "voxcpm==2.0.3",
         "soundfile==0.13.1",
+        "librosa==0.10.2.post1",
         "huggingface-hub[hf-xet]==0.36.0",
-        "librosa",
         "fastapi[standard]",
-        "websockets"
+        "numpy<2.2",
     )
-    .env({
-        "HF_HOME": MODEL_CACHE_PATH,
-        "HF_HUB_CACHE": MODEL_CACHE_PATH,
-        "HF_XET_HIGH_PERFORMANCE": "1",
-    })
+    .env({"HF_HOME": MODEL_CACHE_PATH, "HF_HUB_CACHE": MODEL_CACHE_PATH})
 )
 
-# --- Helper Functions ---
-def _safe_reference_id(value: str) -> str:
-    """Validate the reference ID to prevent path traversal."""
-    if not re.fullmatch(r"[a-f0-9]{32}", value):
-        raise ValueError("Invalid voice reference identifier.")
+
+def _safe_ref(value: str) -> str:
+    if not re.fullmatch(r"[a-f0-9]{32}", value or ""):
+        raise ValueError("Invalid voice reference id.")
     return value
 
-def _decode_audio_to_mono_16k(audio_bytes: bytes) -> tuple:
-    """Decode arbitrary audio bytes into mono 16kHz float32 samples."""
-    import librosa
-    import soundfile as sf
-    samples, sample_rate = sf.read(io.BytesIO(audio_bytes), always_2d=False)
+
+def _decode_reference(audio_bytes: bytes):
+    import librosa, soundfile as sf
+
+    samples, sr = sf.read(io.BytesIO(audio_bytes), always_2d=False)
     if samples.ndim > 1:
         samples = samples.mean(axis=1)
-    if sample_rate != 16000:
-        samples = librosa.resample(samples, orig_sr=sample_rate, target_sr=16000)
+    if sr != 16000:
+        samples = librosa.resample(samples, orig_sr=sr, target_sr=16000)
     return samples, 16000
 
-# --- Modal Class: VoxCPM2 Runtime ---
+
 @app.cls(
     image=image,
-    gpu="L4", # Recommended for the best balance of speed and memory
-    scaledown_window=15, # Terminate 15s after last activity
-    enable_memory_snapshot=True, # Dramatically reduces cold-start time
+    gpu="L4",
+    scaledown_window=15,
+    enable_memory_snapshot=True,
     volumes={
         MODEL_CACHE_PATH: model_volume,
         REFERENCE_CACHE_PATH: reference_volume,
     },
-    secrets=[modal.Secret.from_name("voxcpm2-secrets")] # Optional: for HF token
 )
-class VoxCPM2Runtime:
-    
+class VoxCPM2Service:
     @modal.enter()
-    def load_model(self):
-        """Load the model into VRAM on container start."""
+    def load(self):
         from huggingface_hub import snapshot_download
         from voxcpm import VoxCPM
-        
-        # Download to Volume (cached across container restarts)
-        model_path = snapshot_download(
+
+        path = snapshot_download(
             MODEL_ID,
             revision=MODEL_REVISION,
             local_dir=f"{MODEL_CACHE_PATH}/VoxCPM2",
         )
         model_volume.commit()
-        
-        # Load model, keeping it lean
-        self.model = VoxCPM.from_pretrained(
-            model_path,
-            load_denoiser=False, # We'll denoise reference audio manually if needed
-            optimize=False,
-            device="cuda",
-        )
+
+        self.model = VoxCPM.from_pretrained(path, load_denoiser=False, device="cuda")
         self.sample_rate = int(self.model.tts_model.sample_rate)
+        self.gpu_lock = threading.Lock()
 
-    # --- Voice Reference Management ---
-    @modal.method()
-    def create_reference(self, audio_bytes: bytes, audio_suffix: str) -> dict:
-        """Store a reference audio clip for voice cloning."""
-        import soundfile as sf
-        
-        if not audio_bytes or len(audio_bytes) > 25 * 1024 * 1024:
-            raise ValueError("Reference audio must be between 1 byte and 25 MB.")
-        if audio_suffix not in {".flac", ".mp3", ".ogg", ".wav"}:
-            raise ValueError("Unsupported reference audio format.")
-        
-        reference_id = uuid.uuid4().hex
-        output_path = Path(REFERENCE_CACHE_PATH) / f"{reference_id}.wav"
-        
-        try:
-            samples, sr = _decode_audio_to_mono_16k(audio_bytes)
-            sf.write(output_path, samples, sr, format="WAV")
-        except Exception as e:
-            output_path.unlink(missing_ok=True)
-            raise ValueError("VoxCPM2 could not decode the reference audio.") from e
-        
-        reference_volume.commit()
-        return {
-            "voice_id": reference_id,
-            "provider": "openbmb-voxcpm2-modal",
-            "model_id": MODEL_ID,
-            "model_revision": MODEL_REVISION,
+    # ------------------------------------------------------------------
+    # Streaming generation — runs inside the GPU container
+    # ------------------------------------------------------------------
+    async def _generate_stream(self, ws, msg):
+        import numpy as np
+
+        chunks = [c for c in (msg.get("chunks") or []) if c and c.strip()]
+        if not chunks:
+            await ws.send_json({"error": "No text provided."})
+            return
+
+        voice_id = msg.get("voice_id")
+        design = (msg.get("design_prompt") or "").strip()
+        kwargs = {
+            "cfg_value": float(msg.get("cfg_value", 2.0)),
+            "inference_timesteps": int(msg.get("inference_timesteps", 10)),
+            "normalize": bool(msg.get("normalize", False)),
         }
 
-    # --- Streaming Synthesis (WebSocket) ---
-    @modal.method()
-    async def synthesize_stream(self, websocket):
-        """Bidirectional WebSocket handler for streaming TTS."""
-        await websocket.accept()
-        try:
-            while True:
-                # Receive a JSON message from the client
-                data = await websocket.receive_json()
-                action = data.get("action")
-                
-                if action == "generate":
-                    text = data.get("text", "")
-                    voice_id = data.get("voice_id")  # Optional: for cloning
-                    design_prompt = data.get("design_prompt")  # Optional: for design
-                    
-                    # Prepare generation kwargs
-                    gen_kwargs = {
-                        "cfg_value": data.get("cfg_value", 2.0),
-                        "inference_timesteps": data.get("inference_timesteps", 10),
-                        "normalize": data.get("normalize", False),
-                    }
-                    
-                    # Handle voice cloning
-                    ref_path = None
-                    if voice_id:
-                        ref_path = str(Path(REFERENCE_CACHE_PATH) / f"{_safe_reference_id(voice_id)}.wav")
-                        if not Path(ref_path).exists():
-                            await websocket.send_json({"error": f"Voice ID {voice_id} not found."})
-                            continue
-                        gen_kwargs["reference_wav_path"] = ref_path
-                    
-                    # Handle voice design (prepend instruction to text)
-                    if design_prompt:
-                        text = f"({design_prompt}){text}"
-                    
-                    # Stream the generation
-                    await websocket.send_json({"status": "generating"})
-                    
-                    # VoxCPM2's streaming API yields audio chunks
-                    for chunk in self.model.generate_streaming(
-                        text=text,
-                        **gen_kwargs
-                    ):
-                        # Send raw PCM bytes (frontend can play via Web Audio API)
-                        # We convert to int16 PCM for efficient WebSocket transport
-                        import numpy as np
-                        pcm_int16 = (chunk * 32767).astype(np.int16)
-                        await websocket.send_bytes(pcm_int16.tobytes())
-                    
-                    await websocket.send_json({"status": "complete"})
-                
-                elif action == "ping":
-                    await websocket.send_json({"status": "pong"})
-                
-                elif action == "close":
-                    break
-                    
-        except Exception as e:
-            try:
-                await websocket.send_json({"error": str(e)})
-            except:
-                pass
-        finally:
-            await websocket.close()
-
-    # --- REST Synthesis (for simple/non-streaming requests) ---
-    @modal.method()
-    def synthesize(self, text: str, voice_id: str = None, design_prompt: str = None, **kwargs) -> bytes:
-        """Non-streaming synthesis for simple REST requests."""
-        import soundfile as sf
-        
-        gen_kwargs = {
-            "cfg_value": kwargs.get("cfg_value", 2.0),
-            "inference_timesteps": kwargs.get("inference_timesteps", 10),
-            "normalize": kwargs.get("normalize", False),
-        }
-        
         if voice_id:
-            ref_path = str(Path(REFERENCE_CACHE_PATH) / f"{_safe_reference_id(voice_id)}.wav")
-            if not Path(ref_path).exists():
-                raise ValueError(f"Voice ID {voice_id} not found.")
-            gen_kwargs["reference_wav_path"] = ref_path
-        
-        if design_prompt:
-            text = f"({design_prompt}){text}"
-        
-        wav = self.model.generate(text=text, **gen_kwargs)
-        
-        # Write to in-memory WAV buffer
-        buffer = io.BytesIO()
-        sf.write(buffer, wav, self.sample_rate, format="WAV")
-        buffer.seek(0)
-        return buffer.read()
+            ref = Path(REFERENCE_CACHE_PATH) / f"{_safe_ref(voice_id)}.wav"
+            if not ref.exists():
+                await ws.send_json({"error": f"Voice {voice_id} not found."})
+                return
+            kwargs["reference_wav_path"] = str(ref)
 
-# --- FastAPI Web App ---
-@app.function(
-    image=image,
-    volumes={
-        MODEL_CACHE_PATH: model_volume,
-        REFERENCE_CACHE_PATH: reference_volume,
-    },
-)
-@modal.asgi_app()
-def web_app():
-    from fastapi import FastAPI, UploadFile, File, Response, WebSocket
-    from fastapi.middleware.cors import CORSMiddleware
-    import uuid
-    
-    web = FastAPI(title="VoxCPM2 Voiceover API")
-    
-    # CORS for your Netlify frontend
-    web.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],  # Tighten this in production to your Netlify domain
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    
-    # Get a handle to the runtime (lazy-loads on first use)
-    runtime = VoxCPM2Runtime()
-    
-    @web.get("/health")
-    async def health():
-        return {"status": "ok", "model": MODEL_ID}
-    
-    @web.post("/v1/references")
-    async def upload_reference(file: UploadFile = File(...)):
-        """Upload a reference audio clip for voice cloning."""
-        contents = await file.read()
-        suffix = Path(file.filename).suffix.lower()
-        result = runtime.create_reference.remote(contents, suffix)
-        return result
-    
-    @web.post("/v1/speech")
-    async def synthesize_speech(request: dict):
-        """Non-streaming synthesis endpoint."""
-        audio_bytes = runtime.synthesize.remote(
-            text=request.get("text", ""),
-            voice_id=request.get("voice_id"),
-            design_prompt=request.get("design_prompt"),
-            cfg_value=request.get("cfg_value", 2.0),
-            inference_timesteps=request.get("inference_timesteps", 10),
-            normalize=request.get("normalize", False),
+        await ws.send_json({
+            "status": "start",
+            "sample_rate": self.sample_rate,
+            "chunk_count": len(chunks),
+            "voice_id": voice_id,
+        })
+
+        loop = asyncio.get_running_loop()
+
+        for index, raw in enumerate(chunks):
+            text = f"({design}){raw}" if design else raw
+            await ws.send_json({"status": "chunk_start", "index": index})
+
+            queue: asyncio.Queue = asyncio.Queue()
+            sentinel = object()
+
+            def produce(text=text, kwargs=kwargs, queue=queue, sentinel=sentinel, loop=loop):
+                try:
+                    with self.gpu_lock:
+                        for audio in self.model.generate_streaming(text=text, **kwargs):
+                            loop.call_soon_threadsafe(queue.put_nowait, audio)
+                except Exception as exc:  # surfaced to the client
+                    loop.call_soon_threadsafe(queue.put_nowait, exc)
+                finally:
+                    loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+            threading.Thread(target=produce, daemon=True).start()
+
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                pcm = (
+                    np.clip(np.asarray(item, dtype=np.float32), -1.0, 1.0) * 32767.0
+                ).astype(np.int16)
+                await ws.send_bytes(pcm.tobytes())
+
+            await ws.send_json({"status": "chunk_done", "index": index})
+
+        await ws.send_json({"status": "complete"})
+
+    # ------------------------------------------------------------------
+    # ASGI app, mounted on the GPU container
+    # ------------------------------------------------------------------
+    @modal.asgi_app()
+    def web(self):
+        from fastapi import FastAPI, File, Response, UploadFile, WebSocket, WebSocketDisconnect
+        from fastapi.middleware.cors import CORSMiddleware
+        import soundfile as sf
+
+        api = FastAPI(title="VoxCPM2 Voiceover API")
+        api.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],  # tighten to your Netlify domain in production
+            allow_methods=["*"],
+            allow_headers=["*"],
         )
-        return Response(content=audio_bytes, media_type="audio/wav")
-    
-    @web.websocket("/v1/stream")
-    async def stream_speech(websocket: WebSocket):
-        """WebSocket endpoint for streaming TTS."""
-        await runtime.synthesize_stream.remote(websocket)
-    
-    return web
+
+        @api.get("/health")
+        async def health():
+            return {"status": "ok", "model": MODEL_ID, "sample_rate": self.sample_rate}
+
+        @api.post("/v1/references")
+        async def upload_reference(file: UploadFile = File(...)):
+            data = await file.read()
+            if not data or len(data) > 25 * 1024 * 1024:
+                return Response("Reference must be 1 B – 25 MB.", status_code=400)
+            if Path(file.filename or "").suffix.lower() not in {".wav", ".mp3", ".flac", ".ogg"}:
+                return Response("Unsupported format.", status_code=400)
+
+            voice_id = uuid.uuid4().hex
+            try:
+                samples, sr = _decode_reference(data)
+                sf.write(Path(REFERENCE_CACHE_PATH) / f"{voice_id}.wav", samples, sr)
+            except Exception:
+                return Response("Could not decode the reference audio.", status_code=400)
+
+            reference_volume.commit()
+            return {"voice_id": voice_id, "model_id": MODEL_ID}
+
+        @api.post("/v1/speech")
+        async def speech(payload: dict):
+            import numpy as np
+
+            text = (payload.get("text") or "").strip()
+            if not text:
+                return Response("Empty text.", status_code=400)
+
+            design = (payload.get("design_prompt") or "").strip()
+            kwargs = {
+                "cfg_value": float(payload.get("cfg_value", 2.0)),
+                "inference_timesteps": int(payload.get("inference_timesteps", 10)),
+                "normalize": bool(payload.get("normalize", False)),
+            }
+            voice_id = payload.get("voice_id")
+            if voice_id:
+                kwargs["reference_wav_path"] = str(
+                    Path(REFERENCE_CACHE_PATH) / f"{_safe_ref(voice_id)}.wav"
+                )
+            if design:
+                text = f"({design}){text}"
+
+            wav = await asyncio.to_thread(
+                lambda: self.model.generate(text=text, **kwargs)
+            )
+            buf = io.BytesIO()
+            sf.write(buf, wav, self.sample_rate, format="WAV")
+            return Response(buf.getvalue(), media_type="audio/wav")
+
+        @api.websocket("/v1/stream")
+        async def stream(ws: WebSocket):
+            await ws.accept()
+            try:
+                while True:
+                    msg = await ws.receive_json()
+                    action = msg.get("action")
+                    if action == "generate":
+                        await self._generate_stream(ws, msg)
+                    elif action == "ping":
+                        await ws.send_json({"status": "pong"})
+                    elif action == "close":
+                        break
+            except WebSocketDisconnect:
+                return
+            except Exception as exc:
+                try:
+                    await ws.send_json({"error": str(exc)})
+                except Exception:
+                    pass
+            finally:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+
+        return api

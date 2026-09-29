@@ -1,285 +1,284 @@
-# ============================================================
-# Ontic AI — Backend (Modal + FastAPI + Qwen3-TTS 1.7B Base + CustomVoice)
-# Deploy: modal deploy modal_app.py
-#
-# GPU:          Nvidia L4 (24GB VRAM, native FlashAttention-2)
-# Concurrency:  4 users per L4, max 5 L4s in the workspace
-# Caching:      Model weights baked into the image at build time
-#               Tester codes + generated WAVs in a persistent Volume
-#
-# Models:
-#   - Base         → voice cloning (user-uploaded reference)
-#   - CustomVoice  → preset-speaker TTS (9 built-in voices)
-# ============================================================
+"""
+VoxCPM2 Backend for Modal — Streaming, Voice Design, and Voice Cloning.
+Deploy with: modal deploy modal_backend.py
+"""
 
 import modal
+import io
+import uuid
+import re
+from pathlib import Path
 
-# ---------- Modal App & Volumes ----------
-app = modal.App("ontic-ai")
+# --- Configuration ---
+APP_NAME = "voxcpm2-voiceover-backend"
+MODEL_ID = "openbmb/VoxCPM2"
+MODEL_REVISION = "bffb3df5a29440629464e5e839f4d214c8714c3d" # Pin for stability
+MODEL_CACHE_PATH = "/models"
+REFERENCE_CACHE_PATH = "/voice-references"
 
-data_vol     = modal.Volume.from_name("ontic-ai-data",     create_if_missing=True)
-hf_cache_vol = modal.Volume.from_name("ontic-ai-hf-cache", create_if_missing=True)
+# --- Modal Infrastructure ---
+app = modal.App(APP_NAME)
 
-DATA_DIR   = "/data"
-CODES_FILE = f"{DATA_DIR}/codes.json"
-OUTPUT_DIR = f"{DATA_DIR}/outputs"
-HF_CACHE   = "/root/.cache/huggingface"
+# Persistant volumes for caching model weights and voice references
+model_volume = modal.Volume.from_name("voxcpm2-models", create_if_missing=True)
+reference_volume = modal.Volume.from_name("voxcpm2-voices", create_if_missing=True)
 
-# ---------- Base Image ----------
-base_image = (
-    modal.Image.from_registry("pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime")
-    .apt_install("ffmpeg", "sox", "libsox-dev")
-    .pip_install(
-        "qwen-tts",
-        "fastapi",
-        "python-multipart",
-        "soundfile",
-        "sox",
-        "transformers",
-        "uvicorn[standard]",
-        "aiofiles",
-        "huggingface_hub",
+# Custom image with necessary dependencies
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg", "clang", "build-essential")
+    .uv_pip_install(
+        "torch>=2.5.0",
+        "torchaudio",
+        "voxcpm==2.0.3",
+        "soundfile==0.13.1",
+        "huggingface-hub[hf-xet]==0.36.0",
+        "librosa",
+        "fastapi[standard]",
+        "websockets"
     )
+    .env({
+        "HF_HOME": MODEL_CACHE_PATH,
+        "HF_HUB_CACHE": MODEL_CACHE_PATH,
+        "HF_XET_HIGH_PERFORMANCE": "1",
+    })
 )
 
-# ---------- One-time model download (runs at image build) ----------
-def _download_model():
-    import os
-    from huggingface_hub import snapshot_download
-    cache_dir = os.path.expanduser("~/.cache/huggingface")
-    os.makedirs(cache_dir, exist_ok=True)
-    for repo in [
-        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-        "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    ]:
-        print(f"Pre-downloading {repo} ...")
-        snapshot_download(repo_id=repo, cache_dir=cache_dir)
-    print("✅ Both models cached at image build time.")
+# --- Helper Functions ---
+def _safe_reference_id(value: str) -> str:
+    """Validate the reference ID to prevent path traversal."""
+    if not re.fullmatch(r"[a-f0-9]{32}", value):
+        raise ValueError("Invalid voice reference identifier.")
+    return value
 
-image = base_image.run_function(_download_model)
+def _decode_audio_to_mono_16k(audio_bytes: bytes) -> tuple:
+    """Decode arbitrary audio bytes into mono 16kHz float32 samples."""
+    import librosa
+    import soundfile as sf
+    samples, sample_rate = sf.read(io.BytesIO(audio_bytes), always_2d=False)
+    if samples.ndim > 1:
+        samples = samples.mean(axis=1)
+    if sample_rate != 16000:
+        samples = librosa.resample(samples, orig_sr=sample_rate, target_sr=16000)
+    return samples, 16000
 
-# ---------- Tester Codes ----------
-INITIAL_CODES = {
-    "ONTIC-7K3P": {"tts_left": 2, "clone_left": 1},
-    "ONTIC-M9XQ": {"tts_left": 2, "clone_left": 1},
-    "ONTIC-R4VT": {"tts_left": 2, "clone_left": 1},
-    "ONTIC-H8NW": {"tts_left": 2, "clone_left": 1},
-    "ONTIC-B2ZF": {"tts_left": 2, "clone_left": 1},
-    "ONTIC-D5LC": {"tts_left": 2, "clone_left": 1},
-    "ONTIC-J6YR": {"tts_left": 2, "clone_left": 1},
-    "ONTIC-P3GS": {"tts_left": 2, "clone_left": 1},
-    "ONTIC-T7AM": {"tts_left": 2, "clone_left": 1},
-    "ONTIC-W9EB": {"tts_left": 2, "clone_left": 1},
-}
-
-
-# ============================================================
-# Modal class-based app (required for concurrency controls)
-# ============================================================
+# --- Modal Class: VoxCPM2 Runtime ---
 @app.cls(
     image=image,
-    gpu="L4",                    # 24GB VRAM, native FlashAttention-2
-    cpu=2.0,
-    memory=8192,
+    gpu="L4", # Recommended for the best balance of speed and memory
+    scaledown_window=15, # Terminate 15s after last activity
+    enable_memory_snapshot=True, # Dramatically reduces cold-start time
     volumes={
-        DATA_DIR: data_vol,
+        MODEL_CACHE_PATH: model_volume,
+        REFERENCE_CACHE_PATH: reference_volume,
     },
-    timeout=1800,
-    max_containers=5,            # cap total L4s at 5 (budget shield)
-    scaledown_window=180,        # keep warm 3 min after last request
+    secrets=[modal.Secret.from_name("voxcpm2-secrets")] # Optional: for HF token
 )
-@modal.concurrent(max_inputs=4)
-class QwenTTS:
-    # Loaded once per container, reused across all requests
+class VoxCPM2Runtime:
+    
     @modal.enter()
     def load_model(self):
-        import os, torch
-        from qwen_tts import Qwen3TTSModel
-
-        os.makedirs(DATA_DIR, exist_ok=True)
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        os.makedirs(HF_CACHE, exist_ok=True)
-
-        print("Loading Qwen3-TTS 1.7B Base (for cloning) …")
-        self.base_model = Qwen3TTSModel.from_pretrained(
-            "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-            device_map="cuda:0",
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",   # unlocks FlashAttention-2 on L4
+        """Load the model into VRAM on container start."""
+        from huggingface_hub import snapshot_download
+        from voxcpm import VoxCPM
+        
+        # Download to Volume (cached across container restarts)
+        model_path = snapshot_download(
+            MODEL_ID,
+            revision=MODEL_REVISION,
+            local_dir=f"{MODEL_CACHE_PATH}/VoxCPM2",
         )
-
-        print("Loading Qwen3-TTS 1.7B CustomVoice (for preset-speaker TTS) …")
-        self.custom_model = Qwen3TTSModel.from_pretrained(
-            "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-            device_map="cuda:0",
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",
+        model_volume.commit()
+        
+        # Load model, keeping it lean
+        self.model = VoxCPM.from_pretrained(
+            model_path,
+            load_denoiser=False, # We'll denoise reference audio manually if needed
+            optimize=False,
+            device="cuda",
         )
+        self.sample_rate = int(self.model.tts_model.sample_rate)
 
-        print("✅ Both models ready.")
-
-    # ------------- Storage helpers -------------
-    def _load_codes(self):
-        import os, json
-        if os.path.exists(CODES_FILE):
-            try:
-                with open(CODES_FILE, "r") as f:
-                    data = json.load(f)
-                if isinstance(data, dict) and data:
-                    return data
-            except (json.JSONDecodeError, OSError):
-                pass
-        seed = {k: dict(v) for k, v in INITIAL_CODES.items()}
-        return seed
-
-    def _save_codes(self, codes):
-        import os, json
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(CODES_FILE, "w") as f:
-            json.dump(codes, f, indent=2)
-        data_vol.commit()
-
-    # ------------- HTTP app -------------
-    @modal.asgi_app()
-    def web(self):
-        import os, io, re, uuid
-        import numpy as np
+    # --- Voice Reference Management ---
+    @modal.method()
+    def create_reference(self, audio_bytes: bytes, audio_suffix: str) -> dict:
+        """Store a reference audio clip for voice cloning."""
         import soundfile as sf
-        from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-        from fastapi.responses import FileResponse
-        from fastapi.middleware.cors import CORSMiddleware
+        
+        if not audio_bytes or len(audio_bytes) > 25 * 1024 * 1024:
+            raise ValueError("Reference audio must be between 1 byte and 25 MB.")
+        if audio_suffix not in {".flac", ".mp3", ".ogg", ".wav"}:
+            raise ValueError("Unsupported reference audio format.")
+        
+        reference_id = uuid.uuid4().hex
+        output_path = Path(REFERENCE_CACHE_PATH) / f"{reference_id}.wav"
+        
+        try:
+            samples, sr = _decode_audio_to_mono_16k(audio_bytes)
+            sf.write(output_path, samples, sr, format="WAV")
+        except Exception as e:
+            output_path.unlink(missing_ok=True)
+            raise ValueError("VoxCPM2 could not decode the reference audio.") from e
+        
+        reference_volume.commit()
+        return {
+            "voice_id": reference_id,
+            "provider": "openbmb-voxcpm2-modal",
+            "model_id": MODEL_ID,
+            "model_revision": MODEL_REVISION,
+        }
 
-        # Seed codes file on first boot
-        if not os.path.exists(CODES_FILE):
-            self._save_codes(self._load_codes())
+    # --- Streaming Synthesis (WebSocket) ---
+    @modal.method()
+    async def synthesize_stream(self, websocket):
+        """Bidirectional WebSocket handler for streaming TTS."""
+        await websocket.accept()
+        try:
+            while True:
+                # Receive a JSON message from the client
+                data = await websocket.receive_json()
+                action = data.get("action")
+                
+                if action == "generate":
+                    text = data.get("text", "")
+                    voice_id = data.get("voice_id")  # Optional: for cloning
+                    design_prompt = data.get("design_prompt")  # Optional: for design
+                    
+                    # Prepare generation kwargs
+                    gen_kwargs = {
+                        "cfg_value": data.get("cfg_value", 2.0),
+                        "inference_timesteps": data.get("inference_timesteps", 10),
+                        "normalize": data.get("normalize", False),
+                    }
+                    
+                    # Handle voice cloning
+                    ref_path = None
+                    if voice_id:
+                        ref_path = str(Path(REFERENCE_CACHE_PATH) / f"{_safe_reference_id(voice_id)}.wav")
+                        if not Path(ref_path).exists():
+                            await websocket.send_json({"error": f"Voice ID {voice_id} not found."})
+                            continue
+                        gen_kwargs["reference_wav_path"] = ref_path
+                    
+                    # Handle voice design (prepend instruction to text)
+                    if design_prompt:
+                        text = f"({design_prompt}){text}"
+                    
+                    # Stream the generation
+                    await websocket.send_json({"status": "generating"})
+                    
+                    # VoxCPM2's streaming API yields audio chunks
+                    for chunk in self.model.generate_streaming(
+                        text=text,
+                        **gen_kwargs
+                    ):
+                        # Send raw PCM bytes (frontend can play via Web Audio API)
+                        # We convert to int16 PCM for efficient WebSocket transport
+                        import numpy as np
+                        pcm_int16 = (chunk * 32767).astype(np.int16)
+                        await websocket.send_bytes(pcm_int16.tobytes())
+                    
+                    await websocket.send_json({"status": "complete"})
+                
+                elif action == "ping":
+                    await websocket.send_json({"status": "pong"})
+                
+                elif action == "close":
+                    break
+                    
+        except Exception as e:
+            try:
+                await websocket.send_json({"error": str(e)})
+            except:
+                pass
+        finally:
+            await websocket.close()
 
-        fapp = FastAPI()
-        fapp.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
+    # --- REST Synthesis (for simple/non-streaming requests) ---
+    @modal.method()
+    def synthesize(self, text: str, voice_id: str = None, design_prompt: str = None, **kwargs) -> bytes:
+        """Non-streaming synthesis for simple REST requests."""
+        import soundfile as sf
+        
+        gen_kwargs = {
+            "cfg_value": kwargs.get("cfg_value", 2.0),
+            "inference_timesteps": kwargs.get("inference_timesteps", 10),
+            "normalize": kwargs.get("normalize", False),
+        }
+        
+        if voice_id:
+            ref_path = str(Path(REFERENCE_CACHE_PATH) / f"{_safe_reference_id(voice_id)}.wav")
+            if not Path(ref_path).exists():
+                raise ValueError(f"Voice ID {voice_id} not found.")
+            gen_kwargs["reference_wav_path"] = ref_path
+        
+        if design_prompt:
+            text = f"({design_prompt}){text}"
+        
+        wav = self.model.generate(text=text, **gen_kwargs)
+        
+        # Write to in-memory WAV buffer
+        buffer = io.BytesIO()
+        sf.write(buffer, wav, self.sample_rate, format="WAV")
+        buffer.seek(0)
+        return buffer.read()
+
+# --- FastAPI Web App ---
+@app.function(
+    image=image,
+    volumes={
+        MODEL_CACHE_PATH: model_volume,
+        REFERENCE_CACHE_PATH: reference_volume,
+    },
+)
+@modal.asgi_app()
+def web_app():
+    from fastapi import FastAPI, UploadFile, File, Response, WebSocket
+    from fastapi.middleware.cors import CORSMiddleware
+    import uuid
+    
+    web = FastAPI(title="VoxCPM2 Voiceover API")
+    
+    # CORS for your Netlify frontend
+    web.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Tighten this in production to your Netlify domain
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    # Get a handle to the runtime (lazy-loads on first use)
+    runtime = VoxCPM2Runtime()
+    
+    @web.get("/health")
+    async def health():
+        return {"status": "ok", "model": MODEL_ID}
+    
+    @web.post("/v1/references")
+    async def upload_reference(file: UploadFile = File(...)):
+        """Upload a reference audio clip for voice cloning."""
+        contents = await file.read()
+        suffix = Path(file.filename).suffix.lower()
+        result = runtime.create_reference.remote(contents, suffix)
+        return result
+    
+    @web.post("/v1/speech")
+    async def synthesize_speech(request: dict):
+        """Non-streaming synthesis endpoint."""
+        audio_bytes = runtime.synthesize.remote(
+            text=request.get("text", ""),
+            voice_id=request.get("voice_id"),
+            design_prompt=request.get("design_prompt"),
+            cfg_value=request.get("cfg_value", 2.0),
+            inference_timesteps=request.get("inference_timesteps", 10),
+            normalize=request.get("normalize", False),
         )
-
-        @fapp.get("/")
-        def root():
-            return {"status": "ok", "service": "Ontic AI", "gpu": "L4"}
-
-        # -------- Verify tester code --------
-        @fapp.post("/api/verify-code")
-        async def verify_code(payload: dict):
-            code = (payload.get("code") or "").strip().upper()
-            codes = self._load_codes()
-            if code not in codes:
-                raise HTTPException(404, "Invalid code. Check your DM.")
-            e = codes[code]
-            return {
-                "valid": True,
-                "tts_left": e["tts_left"],
-                "clone_left": e["clone_left"],
-            }
-
-        # -------- Text-to-speech (preset speakers, CustomVoice model) --------
-        @fapp.post("/api/generate")
-        async def generate(
-            code: str = Form(...),
-            text: str = Form(...),
-            voice: str = Form("Eric"),
-            language: str = Form("English"),
-        ):
-            code = code.strip().upper()
-            codes = self._load_codes()
-            if code not in codes:
-                raise HTTPException(404, "Invalid code")
-            entry = codes[code]
-            if entry["tts_left"] <= 0:
-                raise HTTPException(403, "No TTS generations left on this code")
-
-            text = text.strip()
-            if not text:
-                raise HTTPException(400, "Text cannot be empty")
-            if len(text) > 500:
-                raise HTTPException(400, "Text exceeds 500 characters")
-
-            try:
-                wavs, sr = self.custom_model.generate_custom_voice(
-                    text=text,
-                    language=language,
-                    speaker=voice,
-                )
-            except Exception as e:
-                raise HTTPException(500, f"Generation failed: {e}")
-
-            fname = f"{uuid.uuid4().hex}.wav"
-            out_path = os.path.join(OUTPUT_DIR, fname)
-            sf.write(out_path, np.asarray(wavs[0]).squeeze(), sr)
-
-            entry["tts_left"] -= 1
-            self._save_codes(codes)
-
-            return {"audio_url": f"/api/audio/{fname}", "tts_left": entry["tts_left"]}
-
-        # -------- Voice cloning (Base model) --------
-        @fapp.post("/api/clone")
-        async def clone(
-            code: str = Form(...),
-            ref_audio: UploadFile = File(...),
-            ref_text: str = Form(""),
-            target_text: str = Form(...),
-        ):
-            code = code.strip().upper()
-            codes = self._load_codes()
-            if code not in codes:
-                raise HTTPException(404, "Invalid code")
-            entry = codes[code]
-            if entry["clone_left"] <= 0:
-                raise HTTPException(403, "No voice clones left on this code")
-
-            target_text = target_text.strip()
-            if not target_text:
-                raise HTTPException(400, "Target text cannot be empty")
-            if len(target_text) > 500:
-                raise HTTPException(400, "Target text exceeds 500 characters")
-
-            data = await ref_audio.read()
-            try:
-                arr, sr = sf.read(io.BytesIO(data))
-            except Exception as e:
-                raise HTTPException(400, f"Could not read reference audio: {e}")
-
-            ref_path = f"/tmp/ref_{uuid.uuid4().hex}.wav"
-            sf.write(ref_path, arr, sr)
-
-            try:
-                wavs, sr = self.base_model.generate_voice_clone(
-                    text=target_text,
-                    language="English",
-                    ref_audio=ref_path,
-                    ref_text=ref_text.strip() if ref_text and ref_text.strip() else None,
-                )
-            except Exception as e:
-                raise HTTPException(500, f"Cloning failed: {e}")
-            finally:
-                try: os.remove(ref_path)
-                except OSError: pass
-
-            fname = f"{uuid.uuid4().hex}.wav"
-            out_path = os.path.join(OUTPUT_DIR, fname)
-            sf.write(out_path, np.asarray(wavs[0]).squeeze(), sr)
-
-            entry["clone_left"] -= 1
-            self._save_codes(codes)
-
-            return {"audio_url": f"/api/audio/{fname}", "clone_left": entry["clone_left"]}
-
-        # -------- Serve generated audio --------
-        @fapp.get("/api/audio/{fname}")
-        def get_audio(fname: str):
-            if not re.match(r"^[a-f0-9]+\.wav$", fname):
-                raise HTTPException(400, "Invalid filename")
-            p = os.path.join(OUTPUT_DIR, fname)
-            if not os.path.exists(p):
-                raise HTTPException(404, "Audio not found")
-            return FileResponse(p, media_type="audio/wav")
-
-        return fapp
+        return Response(content=audio_bytes, media_type="audio/wav")
+    
+    @web.websocket("/v1/stream")
+    async def stream_speech(websocket: WebSocket):
+        """WebSocket endpoint for streaming TTS."""
+        await runtime.synthesize_stream.remote(websocket)
+    
+    return web
